@@ -65,12 +65,12 @@ class ConversationsService {
     }
 
     // ==========================================
-    // GET ACTIVE ASSIGNED AGENT
+    // GET ACTIVE ASSIGNED AGENTS
     // ==========================================
 
     async getAssignedAgents(ticketId) {
         return this.database.query(
-            `SELECT agent_id
+            `SELECT DISTINCT agent_id
              FROM ticket_assignments
              WHERE ticket_id = ?
              AND unassigned_at IS NULL`,
@@ -79,7 +79,77 @@ class ConversationsService {
     }
 
     // ==========================================
-    // NOTIFICATIONS
+    // AUTOMATICALLY HOLD TICKET
+    // WHEN CUSTOMER IS OFFLINE
+    // ==========================================
+
+    async holdTicketIfCustomerOffline(ticketId, customerId) {
+        const customers = await this.database.query(
+            `SELECT presence_status
+             FROM users
+             WHERE user_id = ?
+             AND is_active = TRUE`,
+            [customerId]
+        );
+
+        if (!customers.length) {
+            throw new NotFoundException('Customer not found');
+        }
+
+        if (customers[0].presence_status !== 'Offline') {
+            return false;
+        }
+
+        // Do not hold Resolved or Closed tickets.
+        // Do not overwrite an existing previous_status.
+        const result = await this.database.query(
+            `UPDATE tickets
+             SET previous_status = status,
+                 status = 'On Hold',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE ticket_id = ?
+             AND status NOT IN (
+                'On Hold',
+                'Resolved',
+                'Closed'
+             )`,
+            [ticketId]
+        );
+
+        if (result.affectedRows > 0) {
+            await this.database.query(
+                `INSERT INTO ticket_activities
+                 (ticket_id, user_id, activity_type, description)
+                 VALUES (?, NULL, 'ON_HOLD', ?)`,
+                [
+                    ticketId,
+                    'Ticket automatically moved to On Hold because the customer was offline.'
+                ]
+            );
+
+            // Notify managers about the automatic hold.
+            const managers = await this.database.query(
+                `SELECT user_id
+                 FROM users
+                 WHERE role = 'manager'
+                 AND is_active = TRUE`
+            );
+
+            for (const manager of managers) {
+                await this.notifications.createNotification(
+                    manager.user_id,
+                    ticketId,
+                    'Ticket On Hold',
+                    `Ticket #${ticketId} was placed On Hold because the customer is offline.`
+                );
+            }
+        }
+
+        return result.affectedRows > 0;
+    }
+
+    // ==========================================
+    // NOTIFY MESSAGE RECIPIENTS
     // ==========================================
 
     async notifyMessageRecipients(ticketId, user, messageType) {
@@ -97,8 +167,8 @@ class ConversationsService {
         const assignedAgents =
             await this.getAssignedAgents(ticketId);
 
-        // PRIVATE CHAT:
-        // Assigned agent and managers only.
+        // PRIVATE CHAT
+        // Assigned agents and managers only.
 
         if (messageType === 'private') {
             if (user.role === 'customer') return;
@@ -135,8 +205,8 @@ class ConversationsService {
             return;
         }
 
-        // COMMON CHAT:
-        // Customer, assigned agent and manager.
+        // PUBLIC CHAT
+        // Customer, assigned agents and managers.
 
         if (user.role === 'customer') {
             for (const agent of assignedAgents) {
@@ -167,7 +237,8 @@ class ConversationsService {
             return;
         }
 
-        // Agent or manager sends common message.
+        // Agent or manager sends public message.
+
         if (user.role === 'agent' || user.role === 'manager') {
             await this.notifications.createNotification(
                 customerId,
@@ -176,7 +247,6 @@ class ConversationsService {
                 `A support team member replied to ticket #${ticketId}.`
             );
 
-            // Notify the other assigned agent when a manager sends a message.
             if (user.role === 'manager') {
                 for (const agent of assignedAgents) {
                     await this.notifications.createNotification(
@@ -197,8 +267,7 @@ class ConversationsService {
     async sendMessage(ticketId, user, data) {
         const message = String(data?.message || '').trim();
 
-        const messageType =
-            data?.message_type || 'public';
+        const messageType = data?.message_type || 'public';
 
         if (!message) {
             throw new BadRequestException(
@@ -212,8 +281,24 @@ class ConversationsService {
             );
         }
 
-        await this.verifyTicketAccess(ticketId, user);
+        const ticket = await this.verifyTicketAccess(
+            ticketId,
+            user
+        );
 
+        // When an assigned agent sends a PUBLIC message
+        // and the customer is offline, hold the ticket.
+        if (
+            user.role === 'agent' &&
+            messageType === 'public'
+        ) {
+            await this.holdTicketIfCustomerOffline(
+                ticketId,
+                ticket.customer_id
+            );
+        }
+
+        // Private message validation.
         if (messageType === 'private') {
             if (!['agent', 'manager'].includes(user.role)) {
                 throw new ForbiddenException(
@@ -233,7 +318,7 @@ class ConversationsService {
             if (
                 user.role === 'agent' &&
                 !assignedAgents.some(
-                    (agent) =>
+                    agent =>
                         Number(agent.agent_id) === Number(user.sub)
                 )
             ) {
@@ -295,8 +380,7 @@ class ConversationsService {
                 ON c.sender_id = u.user_id
         `;
 
-        // CUSTOMER:
-        // Only common messages.
+        // CUSTOMER: public messages only.
 
         if (user.role === 'customer') {
             return this.database.query(
@@ -308,9 +392,7 @@ class ConversationsService {
             );
         }
 
-        // AGENT:
-        // Common messages and private messages
-        // from this agent or managers.
+        // AGENT: public messages and relevant private messages.
 
         if (user.role === 'agent') {
             return this.database.query(
@@ -335,8 +417,7 @@ class ConversationsService {
             );
         }
 
-        // MANAGER:
-        // All messages for the ticket.
+        // MANAGER: all messages.
 
         if (user.role === 'manager') {
             return this.database.query(

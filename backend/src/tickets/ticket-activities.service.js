@@ -6,6 +6,10 @@ class TicketActivitiesService {
         this.database = database;
     }
 
+    // ==========================================
+    // LOG TICKET ACTIVITY
+    // ==========================================
+
     async logActivity({
         ticketId,
         userId,
@@ -27,7 +31,7 @@ class TicketActivitiesService {
             VALUES (?, ?, ?, ?, ?, ?)`,
             [
                 ticketId,
-                userId,
+                userId || null,
                 activityType,
                 oldValue,
                 newValue,
@@ -36,24 +40,28 @@ class TicketActivitiesService {
         );
     }
 
+    // ==========================================
+    // GET TICKET ACTIVITIES
+    // ==========================================
+
     async getActivities(ticketId) {
         return this.database.query(
             `SELECT
                 a.activity_id,
                 a.ticket_id,
                 a.user_id,
-                u.full_name,
-                u.role,
+                COALESCE(u.full_name, 'System') AS full_name,
+                COALESCE(u.role, 'system') AS role,
                 a.activity_type,
                 a.old_value,
                 a.new_value,
                 a.description,
                 a.created_at
              FROM ticket_activities a
-             INNER JOIN users u
+             LEFT JOIN users u
                 ON a.user_id = u.user_id
              WHERE a.ticket_id = ?
-             ORDER BY a.created_at DESC`,
+             ORDER BY a.created_at ASC, a.activity_id ASC`,
             [ticketId]
         );
     }

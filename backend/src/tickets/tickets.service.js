@@ -169,8 +169,6 @@ class TicketsService {
     // ==========================================
 
     async getTickets(user) {
-        // CUSTOMER: Only their own tickets
-
         if (user.role === 'customer') {
             return this.database.query(
                 `SELECT *
@@ -180,9 +178,6 @@ class TicketsService {
                 [user.sub]
             );
         }
-
-        // AGENT: Assigned tickets and unassigned
-        // Open/Reopened tickets
 
         if (user.role === 'agent') {
             return this.database.query(
@@ -201,8 +196,6 @@ class TicketsService {
                 [user.sub]
             );
         }
-
-        // MANAGER: All tickets
 
         if (user.role === 'manager') {
             return this.database.query(
@@ -233,16 +226,12 @@ class TicketsService {
 
         const ticket = tickets[0];
 
-        // Customer access validation
-
         if (
             user.role === 'customer' &&
             Number(ticket.customer_id) !== Number(user.sub)
         ) {
             throw new ForbiddenException('Access denied');
         }
-
-        // Agent access validation
 
         if (user.role === 'agent') {
             const assignments = await this.database.query(
@@ -275,11 +264,117 @@ class TicketsService {
     // ==========================================
 
     async getTicketActivities(ticketId, user) {
-        // Validate ticket access first
-
         await this.getTicketById(ticketId, user);
 
         return this.activities.getActivities(ticketId);
+    }
+
+    // ==========================================
+    // GET COMPLETE TICKET TIMELINE
+    // ==========================================
+
+    async getTicketTimeline(ticketId, user) {
+
+        // Verify ticket access first.
+        await this.getTicketById(ticketId, user);
+
+        // 1. Get ticket activities.
+        const activities =
+            await this.activities.getActivities(ticketId);
+
+        // 2. Get conversations according to user role.
+        let messages = [];
+
+        const commonQuery = `
+            SELECT
+                c.message_id,
+                c.ticket_id,
+                c.sender_id AS user_id,
+                u.full_name,
+                u.role,
+                c.message,
+                c.message_type,
+                c.created_at
+            FROM conversations c
+            INNER JOIN users u
+                ON c.sender_id = u.user_id
+            WHERE c.ticket_id = ?
+        `;
+
+        if (user.role === 'customer') {
+            messages = await this.database.query(
+                `${commonQuery}
+                 AND c.message_type = 'public'
+                 ORDER BY c.created_at ASC`,
+                [ticketId]
+            );
+        } else if (user.role === 'agent') {
+            messages = await this.database.query(
+                `${commonQuery}
+                 AND (
+                    c.message_type = 'public'
+                    OR (
+                        c.message_type = 'private'
+                        AND (
+                            c.sender_id = ?
+                            OR u.role = 'manager'
+                        )
+                    )
+                 )
+                 ORDER BY c.created_at ASC`,
+                [ticketId, user.sub]
+            );
+        } else if (user.role === 'manager') {
+            messages = await this.database.query(
+                `${commonQuery}
+                 ORDER BY c.created_at ASC`,
+                [ticketId]
+            );
+        }
+
+        // 3. Convert activities into timeline events.
+        const activityEvents = activities.map((activity) => ({
+            id: `activity-${activity.activity_id}`,
+            event_type: 'activity',
+            activity_type: activity.activity_type,
+            user_id: activity.user_id,
+            full_name: activity.full_name,
+            role: activity.role,
+            old_value: activity.old_value,
+            new_value: activity.new_value,
+            description: activity.description,
+            created_at: activity.created_at
+        }));
+
+        // 4. Convert messages into timeline events.
+        const messageEvents = messages.map((message) => ({
+            id: `message-${message.message_id}`,
+            event_type: 'message',
+            user_id: message.user_id,
+            full_name: message.full_name,
+            role: message.role,
+            message: message.message,
+            message_type: message.message_type,
+            created_at: message.created_at
+        }));
+
+        // 5. Combine and sort chronologically.
+        const timeline = [
+            ...activityEvents,
+            ...messageEvents
+        ];
+
+        timeline.sort(
+            (a, b) =>
+                new Date(a.created_at).getTime() -
+                new Date(b.created_at).getTime()
+        );
+
+        return {
+            ticket_id: Number(ticketId),
+            total_events: timeline.length,
+            timeline
+        };
     }
 
     // ==========================================
@@ -339,7 +434,8 @@ class TicketsService {
 
         await this.database.query(
             `UPDATE tickets
-             SET status = 'In Progress'
+             SET status = 'In Progress',
+                 previous_status = NULL
              WHERE ticket_id = ?`,
             [id]
         );
@@ -433,8 +529,6 @@ class TicketsService {
             throw new NotFoundException('Active agent not found');
         }
 
-        // Get existing active assignment
-
         const existingAssignments = await this.database.query(
             `SELECT agent_id
              FROM ticket_assignments
@@ -447,8 +541,6 @@ class TicketsService {
             ? existingAssignments[0].agent_id
             : null;
 
-        // Close previous active assignments
-
         await this.database.query(
             `UPDATE ticket_assignments
              SET unassigned_at = CURRENT_TIMESTAMP
@@ -456,8 +548,6 @@ class TicketsService {
              AND unassigned_at IS NULL`,
             [id]
         );
-
-        // Create new assignment
 
         await this.database.query(
             `INSERT INTO ticket_assignments
@@ -472,7 +562,8 @@ class TicketsService {
 
         await this.database.query(
             `UPDATE tickets
-             SET status = 'In Progress'
+             SET status = 'In Progress',
+                 previous_status = NULL
              WHERE ticket_id = ?`,
             [id]
         );
@@ -523,292 +614,6 @@ class TicketsService {
         };
     }
 
-    
-    // ==========================================
-    // REQUEST CLARIFICATION - ASSIGNED AGENT
-    // ==========================================
-
-    async requestClarification(ticketId, user, data) {
-        if (user.role !== 'agent') {
-            throw new ForbiddenException(
-                'Only agents can request clarification'
-            );
-        }
-
-        const question = String(data.question || '').trim();
-
-        if (!question) {
-            throw new BadRequestException(
-                'Clarification question is required'
-            );
-        }
-
-        const tickets = await this.database.query(
-            `SELECT ticket_id, customer_id, status
-             FROM tickets
-             WHERE ticket_id = ?`,
-            [ticketId]
-        );
-
-        if (!tickets.length) {
-            throw new NotFoundException('Ticket not found');
-        }
-
-        const ticket = tickets[0];
-
-        const assignments = await this.database.query(
-            `SELECT assignment_id
-             FROM ticket_assignments
-             WHERE ticket_id = ?
-             AND agent_id = ?
-             AND unassigned_at IS NULL`,
-            [ticketId, user.sub]
-        );
-
-        if (!assignments.length) {
-            throw new ForbiddenException(
-                'You are not assigned to this ticket'
-            );
-        }
-
-        if (['Resolved', 'Closed'].includes(ticket.status)) {
-            throw new ConflictException(
-                'Cannot request clarification for a resolved or closed ticket'
-            );
-        }
-
-   const customers = await this.database.query(
-    `SELECT
-        presence_status,
-        last_seen_at,
-        CASE
-            WHEN presence_status = 'Online'
-             AND last_seen_at >= DATE_SUB(
-                CURRENT_TIMESTAMP,
-                INTERVAL 2 MINUTE
-             )
-            THEN TRUE
-            ELSE FALSE
-        END AS is_online
-     FROM users
-     WHERE user_id = ?
-     AND role = 'customer'`,
-    [ticket.customer_id]
-);
-
-if (!customers.length) {
-    throw new NotFoundException('Customer not found');
-}
-
-const customerOnline = Boolean(
-    customers[0].is_online
-);
-
-        const result = await this.database.query(
-            `INSERT INTO ticket_clarifications
-            (
-                ticket_id,
-                agent_id,
-                customer_id,
-                question,
-                status
-            )
-            VALUES (?, ?, ?, ?, 'Waiting')`,
-            [
-                ticketId,
-                user.sub,
-                ticket.customer_id,
-                question
-            ]
-        );
-
-        const clarificationId = result.insertId;
-
-        await this.logActivity(
-            ticketId,
-            user.sub,
-            'COMMENT_ADDED',
-            null,
-            question,
-            'Agent requested clarification from the customer.'
-        );
-
-        if (customerOnline) {
-            await this.notifications.createNotification(
-                ticket.customer_id,
-                ticketId,
-                'Clarification Requested',
-                `The agent has asked a question about ticket #${ticketId}.`
-            );
-        } else {
-            if (ticket.status !== 'On Hold') {
-                await this.database.query(
-                    `UPDATE tickets
-                     SET status = 'On Hold',
-                         resolved_at = NULL
-                     WHERE ticket_id = ?`,
-                    [ticketId]
-                );
-
-                await this.logActivity(
-                    ticketId,
-                    user.sub,
-                    'ON_HOLD',
-                    ticket.status,
-                    'On Hold',
-                    'Ticket placed On Hold because the customer is offline and clarification is required.'
-                );
-            }
-
-            await this.notifyManagers(
-                ticketId,
-                'Customer Offline - Clarification Required',
-                `Agent #${user.sub} requested clarification for ticket #${ticketId}, but the customer is offline.`
-            );
-        }
-
-        return {
-            message: customerOnline
-                ? 'Clarification requested. Customer is online.'
-                : 'Clarification requested. Customer is offline and ticket is On Hold.',
-            clarification_id: clarificationId,
-            ticket_id: Number(ticketId),
-            customer_online: customerOnline,
-            ticket_status: customerOnline
-                ? ticket.status
-                : 'On Hold'
-        };
-    }
-
-    // ==========================================
-    // RESPOND TO CLARIFICATION - CUSTOMER
-    // ==========================================
-
-    async respondToClarification(
-        ticketId,
-        clarificationId,
-        user,
-        data
-    ) {
-        if (user.role !== 'customer') {
-            throw new ForbiddenException(
-                'Only customers can respond to clarification'
-            );
-        }
-
-        const response = String(data.response || '').trim();
-
-        if (!response) {
-            throw new BadRequestException(
-                'Clarification response is required'
-            );
-        }
-
-        const clarifications = await this.database.query(
-            `SELECT clarification_id,
-                    ticket_id,
-                    agent_id,
-                    customer_id,
-                    status
-             FROM ticket_clarifications
-             WHERE clarification_id = ?
-             AND ticket_id = ?`,
-            [clarificationId, ticketId]
-        );
-
-        if (!clarifications.length) {
-            throw new NotFoundException(
-                'Clarification request not found'
-            );
-        }
-
-        const clarification = clarifications[0];
-
-        if (
-            Number(clarification.customer_id) !== Number(user.sub)
-        ) {
-            throw new ForbiddenException(
-                'You cannot respond to this clarification'
-            );
-        }
-
-        if (clarification.status !== 'Waiting') {
-            throw new ConflictException(
-                'This clarification has already been answered or cancelled'
-            );
-        }
-
-        await this.database.query(
-            `UPDATE ticket_clarifications
-             SET customer_response = ?,
-                 status = 'Responded',
-                 responded_at = CURRENT_TIMESTAMP
-             WHERE clarification_id = ?`,
-            [response, clarificationId]
-        );
-
-        await this.logActivity(
-            ticketId,
-            user.sub,
-            'COMMENT_ADDED',
-            null,
-            response,
-            'Customer responded to the clarification request.'
-        );
-
-        await this.notifications.createNotification(
-            clarification.agent_id,
-            ticketId,
-            'Customer Replied',
-            `The customer has responded to your clarification request for ticket #${ticketId}.`
-        );
-
-        await this.notifyManagers(
-            ticketId,
-            'Customer Clarification Received',
-            `The customer has responded to the clarification request for ticket #${ticketId}.`
-        );
-
-        return {
-            message: 'Clarification response submitted successfully',
-            clarification_id: Number(clarificationId),
-            ticket_id: Number(ticketId),
-            status: 'Responded'
-        };
-    }
-
-    // ==========================================
-    // UPDATE STATUS - AGENT / MANAGER
-    // ==========================================
-
-    // ==========================================
-    // GET CLARIFICATIONS - ALL AUTHORIZED ROLES
-    // ==========================================
-
-    async getClarifications(ticketId, user) {
-        // Verify customer ownership, agent assignment,
-        // or manager access.
-        await this.getTicketById(ticketId, user);
-
-        return this.database.query(
-            `SELECT
-                clarification_id,
-                ticket_id,
-                agent_id,
-                customer_id,
-                question,
-                customer_response,
-                status,
-                created_at,
-                responded_at
-             FROM ticket_clarifications
-             WHERE ticket_id = ?
-             ORDER BY created_at DESC`,
-            [ticketId]
-        );
-    }
-
-    
     // ==========================================
     // RESUME TICKET - MANAGER ONLY
     // ==========================================
@@ -821,7 +626,7 @@ const customerOnline = Boolean(
         }
 
         const tickets = await this.database.query(
-            `SELECT ticket_id, status
+            `SELECT ticket_id, status, previous_status
              FROM tickets
              WHERE ticket_id = ?`,
             [ticketId]
@@ -831,7 +636,8 @@ const customerOnline = Boolean(
             throw new NotFoundException('Ticket not found');
         }
 
-        const oldStatus = tickets[0].status;
+        const ticket = tickets[0];
+        const oldStatus = ticket.status;
 
         if (oldStatus !== 'On Hold') {
             throw new ConflictException(
@@ -839,12 +645,18 @@ const customerOnline = Boolean(
             );
         }
 
+        const restoredStatus = ticket.previous_status || 'In Progress';
+
         await this.database.query(
             `UPDATE tickets
-             SET status = 'In Progress',
-                 resolved_at = NULL
+             SET status = ?,
+                 previous_status = NULL,
+                 resolved_at = CASE
+                    WHEN ? = 'Resolved' THEN CURRENT_TIMESTAMP
+                    ELSE NULL
+                 END
              WHERE ticket_id = ?`,
-            [ticketId]
+            [restoredStatus, restoredStatus, ticketId]
         );
 
         await this.logActivity(
@@ -852,14 +664,14 @@ const customerOnline = Boolean(
             user.sub,
             'STATUS_CHANGED',
             'On Hold',
-            'In Progress',
-            'Manager resumed the ticket.'
+            restoredStatus,
+            `Manager resumed the ticket. Status restored to ${restoredStatus}.`
         );
 
         await this.notifyCustomer(
             ticketId,
             'Ticket Resumed',
-            `Your ticket #${ticketId} is now being processed again.`
+            `Your ticket #${ticketId} has been resumed.`
         );
 
         const assignments = await this.database.query(
@@ -870,9 +682,9 @@ const customerOnline = Boolean(
             [ticketId]
         );
 
-        if (assignments.length) {
+        for (const assignment of assignments) {
             await this.notifications.createNotification(
-                assignments[0].agent_id,
+                assignment.agent_id,
                 ticketId,
                 'Ticket Resumed',
                 `Manager resumed ticket #${ticketId}. You can continue working on it.`
@@ -883,12 +695,13 @@ const customerOnline = Boolean(
             message: 'Ticket resumed successfully',
             ticket_id: Number(ticketId),
             old_status: oldStatus,
-            status: 'In Progress'
+            status: restoredStatus
         };
     }
 
-    
-
+    // ==========================================
+    // UPDATE STATUS - AGENT / MANAGER
+    // ==========================================
 
     async updateStatus(id, status, user) {
         const allowedStatuses = [
@@ -920,8 +733,6 @@ const customerOnline = Boolean(
 
         const oldStatus = tickets[0].status;
 
-        // Validate agent assignment
-
         if (user.role === 'agent') {
             const assignments = await this.database.query(
                 `SELECT assignment_id
@@ -943,11 +754,16 @@ const customerOnline = Boolean(
             );
         }
 
-        // Update status and resolution timestamp
-
         await this.database.query(
             `UPDATE tickets
-             SET status = ?,
+             SET previous_status = CASE
+                    WHEN ? = 'On Hold' AND ? <> 'On Hold'
+                        THEN ?
+                    WHEN ? <> 'On Hold'
+                        THEN NULL
+                    ELSE previous_status
+                 END,
+                 status = ?,
                  resolved_at = CASE
                     WHEN ? = 'Resolved' THEN CURRENT_TIMESTAMP
                     WHEN ? IN ('Open', 'In Progress', 'On Hold', 'Reopened')
@@ -955,10 +771,17 @@ const customerOnline = Boolean(
                     ELSE resolved_at
                  END
              WHERE ticket_id = ?`,
-            [status, status, status, id]
+            [
+                status,
+                oldStatus,
+                oldStatus,
+                status,
+                status,
+                status,
+                status,
+                id
+            ]
         );
-
-        // Record activity only when status actually changes
 
         if (oldStatus !== status) {
             let activityType = 'STATUS_CHANGED';

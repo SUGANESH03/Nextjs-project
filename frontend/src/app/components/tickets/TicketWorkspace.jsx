@@ -41,33 +41,58 @@ export default function TicketWorkspace({ ticketId, role }) {
     const [messages, setMessages] = useState([]);
     const [activities, setActivities] = useState([]);
     const [agents, setAgents] = useState([]);
-    const [clarifications, setClarifications] = useState([]);
 
     const [message, setMessage] = useState("");
     const [isPrivate, setIsPrivate] = useState(false);
-
-    const [question, setQuestion] = useState("");
-    const [responses, setResponses] = useState({});
 
     const [status, setStatus] = useState("");
     const [agentId, setAgentId] = useState("");
 
     const [loading, setLoading] = useState(true);
     const [sending, setSending] = useState(false);
-    const [requesting, setRequesting] = useState(false);
-    const [respondingId, setRespondingId] = useState(null);
     const [updating, setUpdating] = useState(false);
     const [assigning, setAssigning] = useState(false);
     const [error, setError] = useState("");
 
+    const [currentUserId, setCurrentUserId] = useState(null);
+
     const [reopenReason, setReopenReason] = useState("");
-const [reopenRequests, setReopenRequests] = useState([]);
-const [submittingReopen, setSubmittingReopen] = useState(false);
+    const [reopenRequests, setReopenRequests] = useState([]);
+    const [submittingReopen, setSubmittingReopen] = useState(false);
+
+    // ==========================================
+    // CURRENT USER
+    // ==========================================
+
+    useEffect(() => {
+        try {
+            const storedUser = JSON.parse(
+                localStorage.getItem("user") || "{}"
+            );
+
+            setCurrentUserId(
+                storedUser.user_id ?? storedUser.sub ?? null
+            );
+        } catch (err) {
+            console.error("Unable to read current user:", err);
+        }
+    }, []);
+
+    // ==========================================
+    // NORMALIZE API RESPONSES
+    // ==========================================
 
     const normalizeList = (response, key) => {
         if (Array.isArray(response)) return response;
-        if (Array.isArray(response?.[key])) return response[key];
-        if (Array.isArray(response?.data)) return response.data;
+
+        if (Array.isArray(response?.[key])) {
+            return response[key];
+        }
+
+        if (Array.isArray(response?.data)) {
+            return response.data;
+        }
+
         return [];
     };
 
@@ -75,7 +100,19 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         return normalizeList(response, "messages");
     };
 
+    const normalizeTicket = (response) => {
+        return (
+            response?.ticket ||
+            response?.data?.ticket ||
+            response?.data ||
+            response
+        );
+    };
+
+    // ==========================================
     // LOAD MESSAGES
+    // ==========================================
+
     const loadMessages = useCallback(async () => {
         try {
             const response =
@@ -95,21 +132,52 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         }
     }, [ticketId, role]);
 
-    // LOAD CLARIFICATIONS
-    const loadClarifications = useCallback(async () => {
-        try {
-            const result =
-                await ticketService.getClarifications(ticketId);
+    // ==========================================
+    // REFRESH TICKET STATUS
+    // ==========================================
 
-            setClarifications(
-                normalizeList(result, "clarifications")
-            );
+    const refreshTicket = useCallback(async () => {
+        try {
+            const result = await ticketService.getById(ticketId);
+            const ticketData = normalizeTicket(result);
+
+            setTicket(ticketData);
+            setStatus(ticketData.status || "");
         } catch (err) {
-            console.error("Unable to load clarifications:", err);
+            console.error("Unable to refresh ticket:", err);
         }
     }, [ticketId]);
 
+    // ==========================================
+    // LOAD CUSTOMER REOPEN REQUESTS
+    // ==========================================
+
+    const loadMyReopenRequests = useCallback(async () => {
+        if (role !== "customer") return;
+
+        try {
+            const result =
+                await ticketService.getMyReopenRequests();
+
+            setReopenRequests(
+                Array.isArray(result)
+                    ? result
+                    : Array.isArray(result?.data)
+                        ? result.data
+                        : []
+            );
+        } catch (err) {
+            console.error(
+                "Unable to load reopen requests:",
+                err
+            );
+        }
+    }, [role]);
+
+    // ==========================================
     // LOAD COMPLETE WORKSPACE
+    // ==========================================
+
     const loadWorkspace = useCallback(async () => {
         try {
             setError("");
@@ -120,11 +188,7 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
                     conversationService.getMessages(ticketId)
                 ]);
 
-            const ticketData =
-                ticketResult?.ticket ||
-                ticketResult?.data?.ticket ||
-                ticketResult?.data ||
-                ticketResult;
+            const ticketData = normalizeTicket(ticketResult);
 
             setTicket(ticketData);
             setStatus(ticketData.status || "");
@@ -151,12 +215,6 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
                 setActivities([]);
             }
 
-            try {
-                await loadClarifications();
-            } catch (err) {
-                console.error("Clarification loading failed:", err);
-            }
-
             if (role === "manager") {
                 try {
                     const agentResult = await agentService.getAll();
@@ -166,7 +224,12 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
                     );
                 } catch (err) {
                     console.error("Unable to load agents:", err);
+                    setAgents([]);
                 }
+            }
+
+            if (role === "customer") {
+                await loadMyReopenRequests();
             }
         } catch (err) {
             console.error("Workspace error:", err);
@@ -178,9 +241,12 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         } finally {
             setLoading(false);
         }
-    }, [ticketId, role, loadClarifications]);
+    }, [ticketId, role, loadMyReopenRequests]);
 
+    // ==========================================
     // INITIAL LOAD AND AUTOMATIC REFRESH
+    // ==========================================
+
     useEffect(() => {
         if (!ticketId) return;
 
@@ -189,7 +255,7 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
 
         const interval = setInterval(() => {
             loadMessages();
-            loadClarifications();
+            refreshTicket();
         }, 5000);
 
         return () => clearInterval(interval);
@@ -197,10 +263,13 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         ticketId,
         loadWorkspace,
         loadMessages,
-        loadClarifications
+        refreshTicket
     ]);
 
+    // ==========================================
     // SEND MESSAGE
+    // ==========================================
+
     const handleSendMessage = async (e) => {
         e.preventDefault();
 
@@ -222,7 +291,11 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
             );
 
             setMessage("");
-            await loadMessages();
+
+            await Promise.all([
+                loadMessages(),
+                refreshTicket()
+            ]);
         } catch (err) {
             setError(
                 err.response?.data?.message ||
@@ -233,81 +306,10 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         }
     };
 
-    // AGENT: REQUEST CLARIFICATION
-    const handleRequestClarification = async (e) => {
-        e.preventDefault();
-
-        const trimmedQuestion = question.trim();
-
-        if (!trimmedQuestion) {
-            setError("Please enter a clarification question.");
-            return;
-        }
-
-        try {
-            setRequesting(true);
-            setError("");
-
-            await ticketService.requestClarification(
-                ticketId,
-                trimmedQuestion
-            );
-
-            setQuestion("");
-
-            await loadWorkspace();
-
-            alert("Clarification request submitted successfully.");
-        } catch (err) {
-            setError(
-                err.response?.data?.message ||
-                "Unable to request clarification."
-            );
-        } finally {
-            setRequesting(false);
-        }
-    };
-
-    // CUSTOMER: RESPOND TO CLARIFICATION
-    const handleClarificationResponse = async (clarificationId) => {
-        const responseText = String(
-            responses[clarificationId] || ""
-        ).trim();
-
-        if (!responseText) {
-            setError("Please enter your clarification response.");
-            return;
-        }
-
-        try {
-            setRespondingId(clarificationId);
-            setError("");
-
-            await ticketService.respondToClarification(
-                ticketId,
-                clarificationId,
-                responseText
-            );
-
-            setResponses((previous) => ({
-                ...previous,
-                [clarificationId]: ""
-            }));
-
-            await loadWorkspace();
-
-            alert("Your clarification response was submitted.");
-        } catch (err) {
-            setError(
-                err.response?.data?.message ||
-                "Unable to submit clarification response."
-            );
-        } finally {
-            setRespondingId(null);
-        }
-    };
-
+    // ==========================================
     // MANAGER: UPDATE STATUS
+    // ==========================================
+
     const handleStatusUpdate = async () => {
         if (!status) return;
 
@@ -330,7 +332,10 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         }
     };
 
+    // ==========================================
     // MANAGER: ASSIGN AGENT
+    // ==========================================
+
     const handleAssign = async () => {
         if (!agentId) {
             alert("Please select an agent.");
@@ -361,7 +366,10 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         }
     };
 
+    // ==========================================
     // MANAGER: RESUME ON HOLD TICKET
+    // ==========================================
+
     const handleResumeTicket = async () => {
         if (
             !window.confirm(
@@ -390,58 +398,52 @@ const [submittingReopen, setSubmittingReopen] = useState(false);
         }
     };
 
-const loadMyReopenRequests = useCallback(async () => {
-    if (role !== "customer") return;
+    // ==========================================
+    // CUSTOMER: REQUEST REOPEN
+    // ==========================================
 
-    try {
-        const result = await ticketService.getMyReopenRequests();
-        setReopenRequests(
-            Array.isArray(result)
-                ? result
-                : Array.isArray(result?.data)
-                    ? result.data
-                    : []
-        );
-    } catch (err) {
-        console.error("Unable to load reopen requests:", err);
-    }
-}, [role]);
+    const handleRequestReopen = async (e) => {
+        e.preventDefault();
 
-const handleRequestReopen = async (e) => {
-    e.preventDefault();
+        const reason = reopenReason.trim();
 
-    const reason = reopenReason.trim();
+        if (reason.length < 5) {
+            setError(
+                "Please enter a reopening reason with at least 5 characters."
+            );
+            return;
+        }
 
-    if (reason.length < 5) {
-        setError("Please enter a reopening reason with at least 5 characters.");
-        return;
-    }
+        try {
+            setSubmittingReopen(true);
+            setError("");
 
-    try {
-        setSubmittingReopen(true);
-        setError("");
+            await ticketService.requestReopen(ticketId, reason);
 
-        await ticketService.requestReopen(ticketId, reason);
+            setReopenReason("");
 
-        setReopenReason("");
+            await Promise.all([
+                loadMyReopenRequests(),
+                loadWorkspace()
+            ]);
 
-        await Promise.all([
-            loadMyReopenRequests(),
-            loadWorkspace()
-        ]);
+            alert(
+                "Your reopening request has been submitted to the manager."
+            );
+        } catch (err) {
+            setError(
+                err.response?.data?.message ||
+                "Unable to submit reopening request."
+            );
+        } finally {
+            setSubmittingReopen(false);
+        }
+    };
 
-        alert("Your reopening request has been submitted to the manager.");
-    } catch (err) {
-        setError(
-            err.response?.data?.message ||
-            "Unable to submit reopening request."
-        );
-    } finally {
-        setSubmittingReopen(false);
-    }
-};
-
+    // ==========================================
     // DATE FORMAT
+    // ==========================================
+
     const formatDate = (date) => {
         if (!date) return "Date unavailable";
 
@@ -459,16 +461,16 @@ const handleRequestReopen = async (e) => {
             minute: "2-digit"
         });
     };
-    useEffect(() => {
-    if (role === "customer") {
-        loadMyReopenRequests();
-    }
-}, [role, loadMyReopenRequests]);
+
+    // ==========================================
+    // LOADING
+    // ==========================================
 
     if (loading) {
         return (
             <div className="text-center py-5">
                 <div className="spinner-border text-primary" />
+
                 <p className="text-muted mt-2">
                     Loading ticket workspace...
                 </p>
@@ -492,6 +494,10 @@ const handleRequestReopen = async (e) => {
         );
     }
 
+    // ==========================================
+    // MESSAGE VISIBILITY
+    // ==========================================
+
     const canSendPrivate =
         role === "agent" || role === "manager";
 
@@ -502,9 +508,14 @@ const handleRequestReopen = async (e) => {
         );
     });
 
+    // ==========================================
+    // UI
+    // ==========================================
+
     return (
         <div>
             {/* ERROR MESSAGE */}
+
             {error && (
                 <div className="alert alert-danger d-flex justify-content-between align-items-center">
                     <span>{error}</span>
@@ -518,6 +529,7 @@ const handleRequestReopen = async (e) => {
             )}
 
             {/* TICKET DETAILS */}
+
             <div className="card border-0 shadow-sm mb-4">
                 <div className="card-body p-4">
                     <div className="d-flex justify-content-between flex-wrap gap-3">
@@ -576,68 +588,73 @@ const handleRequestReopen = async (e) => {
                 </div>
             </div>
 
-{/* CUSTOMER: REQUEST REOPEN */}
-{role === "customer" &&
-    ["Resolved", "Closed"].includes(ticket.status) && (
-        <div className="card border-0 shadow-sm mb-4">
-            <div className="card-body p-4">
-                <h5 className="fw-bold mb-2">
-                    <i className="bi bi-arrow-counterclockwise text-primary me-2"></i>
-                    Reopen Ticket
-                </h5>
+            {/* CUSTOMER: REQUEST REOPEN */}
 
-                <p className="text-muted">
-                    If your issue is not resolved, submit a reopening
-                    request with a reason. The manager will review it.
-                </p>
+            {role === "customer" &&
+                ["Resolved", "Closed"].includes(ticket.status) && (
+                    <div className="card border-0 shadow-sm mb-4">
+                        <div className="card-body p-4">
+                            <h5 className="fw-bold mb-2">
+                                <i className="bi bi-arrow-counterclockwise text-primary me-2"></i>
+                                Reopen Ticket
+                            </h5>
 
-                {reopenRequests.some(
-                    (item) =>
-                        Number(item.ticket_id) === Number(ticketId) &&
-                        item.status === "Pending"
-                ) ? (
-                    <div className="alert alert-warning mb-0">
-                        <i className="bi bi-clock me-2"></i>
-                        Your reopening request is pending manager approval.
+                            <p className="text-muted">
+                                If your issue is not resolved, submit a
+                                reopening request with a reason. The
+                                manager will review it.
+                            </p>
+
+                            {reopenRequests.some(
+                                (item) =>
+                                    Number(item.ticket_id) ===
+                                        Number(ticketId) &&
+                                    item.status === "Pending"
+                            ) ? (
+                                <div className="alert alert-warning mb-0">
+                                    <i className="bi bi-clock me-2"></i>
+                                    Your reopening request is pending
+                                    manager approval.
+                                </div>
+                            ) : (
+                                <form onSubmit={handleRequestReopen}>
+                                    <label className="form-label fw-semibold">
+                                        Reason for reopening
+                                    </label>
+
+                                    <textarea
+                                        className="form-control mb-3"
+                                        rows="3"
+                                        placeholder="Explain why this ticket needs to be reopened..."
+                                        value={reopenReason}
+                                        onChange={(e) =>
+                                            setReopenReason(e.target.value)
+                                        }
+                                        required
+                                    />
+
+                                    <button
+                                        type="submit"
+                                        className="btn btn-primary"
+                                        disabled={
+                                            submittingReopen ||
+                                            reopenReason.trim().length < 5
+                                        }
+                                    >
+                                        <i className="bi bi-arrow-counterclockwise me-2"></i>
+
+                                        {submittingReopen
+                                            ? "Submitting..."
+                                            : "Request Reopen"}
+                                    </button>
+                                </form>
+                            )}
+                        </div>
                     </div>
-                ) : (
-                    <form onSubmit={handleRequestReopen}>
-                        <label className="form-label fw-semibold">
-                            Reason for reopening
-                        </label>
-
-                        <textarea
-                            className="form-control mb-3"
-                            rows="3"
-                            placeholder="Explain why this ticket needs to be reopened..."
-                            value={reopenReason}
-                            onChange={(e) =>
-                                setReopenReason(e.target.value)
-                            }
-                            required
-                        />
-
-                        <button
-                            type="submit"
-                            className="btn btn-primary"
-                            disabled={
-                                submittingReopen ||
-                                reopenReason.trim().length < 5
-                            }
-                        >
-                            <i className="bi bi-arrow-counterclockwise me-2"></i>
-                            {submittingReopen
-                                ? "Submitting..."
-                                : "Request Reopen"}
-                        </button>
-                    </form>
                 )}
-            </div>
-        </div>
-    )}
-
 
             {/* MANAGER CONTROLS */}
+
             {role === "manager" && (
                 <div className="card border-0 shadow-sm mb-4">
                     <div className="card-body p-4">
@@ -718,7 +735,8 @@ const handleRequestReopen = async (e) => {
                                 </div>
                             </div>
 
-                            {/* RESUME ON HOLD TICKET */}
+                            {/* MANUAL RESUME */}
+
                             {ticket.status === "On Hold" && (
                                 <div className="col-12">
                                     <div className="alert alert-warning d-flex justify-content-between align-items-center flex-wrap gap-3 mb-0">
@@ -729,7 +747,9 @@ const handleRequestReopen = async (e) => {
                                             </strong>
 
                                             <p className="mb-0 small">
-                                                Review the customer's clarification before resuming.
+                                                Review the customer's latest
+                                                messages before manually
+                                                resuming this ticket.
                                             </p>
                                         </div>
 
@@ -753,171 +773,8 @@ const handleRequestReopen = async (e) => {
                 </div>
             )}
 
-            {/* CLARIFICATION WORKFLOW */}
-            <div className="card border-0 shadow-sm mb-4">
-                <div className="card-body p-4">
-                    <div className="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
-                        <div>
-                            <h5 className="fw-bold mb-1">
-                                <i className="bi bi-question-circle me-2 text-primary"></i>
-                                Clarification
-                            </h5>
-
-                            <small className="text-muted">
-                                Questions and responses related to this ticket
-                            </small>
-                        </div>
-
-                        <span className="badge text-bg-secondary">
-                            {clarifications.length} Requests
-                        </span>
-                    </div>
-
-                    {/* AGENT REQUEST FORM */}
-                    {role === "agent" &&
-                        !["Resolved", "Closed"].includes(ticket.status) && (
-                            <form
-                                onSubmit={handleRequestClarification}
-                                className="bg-light rounded p-3 mb-4"
-                            >
-                                <label className="form-label fw-semibold">
-                                    Ask customer for clarification
-                                </label>
-
-                                <textarea
-                                    className="form-control mb-3"
-                                    rows="3"
-                                    placeholder="Example: Please share a screenshot of the error."
-                                    value={question}
-                                    onChange={(e) =>
-                                        setQuestion(e.target.value)
-                                    }
-                                />
-
-                                <button
-                                    type="submit"
-                                    className="btn btn-primary"
-                                    disabled={requesting}
-                                >
-                                    <i className="bi bi-send me-2"></i>
-
-                                    {requesting
-                                        ? "Submitting..."
-                                        : "Request Clarification"}
-                                </button>
-                            </form>
-                        )}
-
-                    {/* CLARIFICATION LIST */}
-                    {clarifications.length === 0 ? (
-                        <div className="text-center text-muted py-4">
-                            <i className="bi bi-chat-square-text fs-2"></i>
-                            <p className="mb-0 mt-2">
-                                No clarification requests yet.
-                            </p>
-                        </div>
-                    ) : (
-                        <div className="d-flex flex-column gap-3">
-                            {clarifications.map((item) => (
-                                <div
-                                    key={item.clarification_id}
-                                    className="border rounded p-3"
-                                >
-                                    <div className="d-flex justify-content-between flex-wrap gap-2">
-                                        <strong>
-                                            <i className="bi bi-question-circle me-2 text-primary"></i>
-                                            Agent's Question
-                                        </strong>
-
-                                        <span
-                                            className={`badge ${
-                                                item.status === "Responded"
-                                                    ? "text-bg-success"
-                                                    : item.status === "Cancelled"
-                                                        ? "text-bg-secondary"
-                                                        : "text-bg-warning"
-                                            }`}
-                                        >
-                                            {item.status}
-                                        </span>
-                                    </div>
-
-                                    <p className="mt-2 mb-1">
-                                        {item.question}
-                                    </p>
-
-                                    <small className="text-muted">
-                                        Asked: {formatDate(item.created_at)}
-                                    </small>
-
-                                    {item.customer_response && (
-                                        <div className="alert alert-success mt-3 mb-0">
-                                            <strong>
-                                                <i className="bi bi-reply me-2"></i>
-                                                Customer Response
-                                            </strong>
-
-                                            <p className="mb-1 mt-2">
-                                                {item.customer_response}
-                                            </p>
-
-                                            <small className="text-muted">
-                                                Responded: {formatDate(item.responded_at)}
-                                            </small>
-                                        </div>
-                                    )}
-
-                                    {/* CUSTOMER RESPONSE FORM */}
-                                    {role === "customer" &&
-                                        item.status === "Waiting" && (
-                                            <div className="mt-3">
-                                                <label className="form-label fw-semibold">
-                                                    Your Response
-                                                </label>
-
-                                                <textarea
-                                                    className="form-control mb-2"
-                                                    rows="3"
-                                                    placeholder="Enter your response..."
-                                                    value={
-                                                        responses[item.clarification_id] || ""
-                                                    }
-                                                    onChange={(e) =>
-                                                        setResponses((previous) => ({
-                                                            ...previous,
-                                                            [item.clarification_id]: e.target.value
-                                                        }))
-                                                    }
-                                                />
-
-                                                <button
-                                                    type="button"
-                                                    className="btn btn-success"
-                                                    onClick={() =>
-                                                        handleClarificationResponse(
-                                                            item.clarification_id
-                                                        )
-                                                    }
-                                                    disabled={
-                                                        respondingId === item.clarification_id
-                                                    }
-                                                >
-                                                    <i className="bi bi-send me-2"></i>
-
-                                                    {respondingId === item.clarification_id
-                                                        ? "Submitting..."
-                                                        : "Submit Response"}
-                                                </button>
-                                            </div>
-                                        )}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            </div>
-
             {/* ACTIVITY TIMELINE */}
+
             <div className="card border-0 shadow-sm mb-4">
                 <div className="card-body p-4">
                     <h5 className="fw-bold mb-3">
@@ -942,8 +799,9 @@ const handleRequestReopen = async (e) => {
                                     <div className="text-primary fs-5">
                                         <i
                                             className={`bi ${
-                                                ACTIVITY_ICONS[activity.activity_type] ||
-                                                "bi-circle"
+                                                ACTIVITY_ICONS[
+                                                    activity.activity_type
+                                                ] || "bi-circle"
                                             }`}
                                         ></i>
                                     </div>
@@ -972,7 +830,8 @@ const handleRequestReopen = async (e) => {
                 </div>
             </div>
 
-            {/* CONVERSATION */}
+            {/* TICKET CONVERSATION */}
+
             <div className="card border-0 shadow-sm mb-4">
                 <div className="card-body p-4">
                     <div className="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
@@ -983,7 +842,7 @@ const handleRequestReopen = async (e) => {
                             </h5>
 
                             <small className="text-muted">
-                                Messages refresh automatically every 5 seconds
+                                Messages refresh automatically every 5 seconds.
                             </small>
                         </div>
 
@@ -993,6 +852,7 @@ const handleRequestReopen = async (e) => {
                     </div>
 
                     {/* MESSAGE LIST */}
+
                     <div
                         className="bg-light rounded p-3 mb-3"
                         style={{
@@ -1004,6 +864,7 @@ const handleRequestReopen = async (e) => {
                         {visibleMessages.length === 0 ? (
                             <div className="text-center text-muted py-5">
                                 <i className="bi bi-chat-left-text fs-2"></i>
+
                                 <p className="mb-0 mt-2">
                                     No messages yet. Start the conversation.
                                 </p>
@@ -1015,14 +876,9 @@ const handleRequestReopen = async (e) => {
                                         item.sender_id ?? item.user_id;
 
                                     const isOwnMessage =
+                                        currentUserId !== null &&
                                         String(senderId) ===
-                                        String(
-                                            typeof window !== "undefined"
-                                                ? JSON.parse(
-                                                    localStorage.getItem("user") || "{}"
-                                                )?.user_id
-                                                : ""
-                                        );
+                                            String(currentUserId);
 
                                     return (
                                         <div
@@ -1084,6 +940,7 @@ const handleRequestReopen = async (e) => {
                     </div>
 
                     {/* MESSAGE FORM */}
+
                     <form onSubmit={handleSendMessage}>
                         {canSendPrivate && (
                             <div className="form-check mb-3">
@@ -1132,6 +989,12 @@ const handleRequestReopen = async (e) => {
                         {role === "customer" && (
                             <small className="text-muted d-block mt-2">
                                 Your messages are visible to the assigned support team.
+                            </small>
+                        )}
+
+                        {canSendPrivate && (
+                            <small className="text-muted d-block mt-2">
+                                Private messages are visible only to authorized support-team members.
                             </small>
                         )}
                     </form>

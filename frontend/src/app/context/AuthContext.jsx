@@ -1,4 +1,3 @@
-
 "use client";
 
 import {
@@ -12,9 +11,34 @@ import authService from "../services/authService";
 
 const AuthContext = createContext(null);
 
+const API_URL = "http://localhost:4000/api";
+
 export function AuthProvider({ children }) {
     const [user, setUser] = useState(null);
     const [loading, setLoading] = useState(true);
+
+    // Update backend presence
+    const updatePresence = async (status) => {
+        const token = localStorage.getItem("token");
+
+        if (!token) return;
+
+        try {
+            await fetch(`${API_URL}/presence/${status}`, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({})
+            });
+        } catch (error) {
+            console.error(
+                `Failed to update ${status} status:`,
+                error
+            );
+        }
+    };
 
     // Restore existing login session
     useEffect(() => {
@@ -30,12 +54,10 @@ export function AuthProvider({ children }) {
                     return;
                 }
 
-                // Restore user immediately from saved session
                 if (savedUser?.role && active) {
                     setUser(savedUser);
                 }
 
-                // Verify token with backend
                 const response = await authService.getProfile();
 
                 const currentUser = response.user || response;
@@ -47,9 +69,14 @@ export function AuthProvider({ children }) {
                         "user",
                         JSON.stringify(currentUser)
                     );
+
+                    await updatePresence("online");
                 }
             } catch (error) {
-                console.error("Session restoration failed:", error);
+                console.error(
+                    "Session restoration failed:",
+                    error
+                );
 
                 if (active) {
                     localStorage.removeItem("token");
@@ -85,6 +112,8 @@ export function AuthProvider({ children }) {
 
             setUser(loggedInUser);
 
+            await updatePresence("online");
+
             return loggedInUser;
         } finally {
             setLoading(false);
@@ -97,9 +126,16 @@ export function AuthProvider({ children }) {
     };
 
     // Logout
-    const logout = () => {
-        setUser(null);
-        authService.logout();
+    const logout = async () => {
+        try {
+            // Update presence BEFORE removing the token
+            await updatePresence("offline");
+        } catch (error) {
+            console.error("Logout presence error:", error);
+        } finally {
+            setUser(null);
+            authService.logout();
+        }
     };
 
     return (
